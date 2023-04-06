@@ -26,12 +26,11 @@ module OLE_Module
     # ----------------------------------------------------------------------------------
     function solve_SINDy(prob::Modified_SINDy_Problem, OLE_params::OLE)
         prob.Θ = prob.Lib(prob.u, OLE_params.x)
-        counter = 0
     
         function loss(x, p)
+            prob.active_Ξ = ones(size(prob.active_Ξ))
             prob.Θ = prob.Lib(prob.u, OLE_params.x)
             Ξes, loss = sparsify(prob)
-            counter += 1
             return loss
         end
 
@@ -45,10 +44,8 @@ module OLE_Module
         end
 
         OLE_params.x = solve(optprob, OLE_params.opt).u
-
-        println(OLE_params.x)
         
         prob.Θ = prob.Lib(prob.u, OLE_params.x)
-        return sparsify(prob)..., OLE_params.x, counter
+        return sparsify(prob)..., OLE_params.x
     end
 end
