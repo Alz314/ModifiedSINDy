@@ -49,6 +49,7 @@ module SINDy_Base
         lower_bounds::Vector{Float32}
         iter::Int16
         ρ::Float64
+        η::Float64
         abstol::Float64
         reltol::Float64
         Θ::Matrix{Float64}
@@ -64,8 +65,9 @@ module SINDy_Base
         #lbs = repeat(lbs, 1, size(u)[2])
         Θ = Lib(u, alg.x)
         active_Ξ = ones((length(basis), size(u)[2]))
-        ρ = mean(log10.(eigen(Θ'*Θ).values))/10
-        return Modified_SINDy_Problem(u, du, dt, basis, Lib, alg, STRRidge, λs, ubs, lbs, iter, ρ, 0.000001, 0.000001, Θ, active_Ξ)
+        ρ = mean(log10.(eigen(Θ'*Θ).values))
+        η = ρ
+        return Modified_SINDy_Problem(u, du, dt, basis, Lib, alg, STRRidge, λs, ubs, lbs, iter, ρ, η, 0.000001, 0.000001, Θ, active_Ξ)
     end
 
     BaggingSTLSQ(batches, pct_size, tol) = BaggingSTLSQ(batches, pct_size, tol, true, [])
@@ -231,6 +233,9 @@ module SINDy_Base
         X_prev = prob.Θ * Ξes # our first SINDy prediction
         Ξes = Ξes .* prob.active_Ξ
 
+
+        ρs = prob.STRRidge ? prob.ρ*[1+(i-1)/10 for i=1:prob.iter] : fill(prob.ρ, prob.iter)
+
         for i=1:prob.iter
             # At each iteration, try all λ values to find the best one
             prob.active_Ξ = (abs.(Ξes) .> prob.lower_bounds) .|| (abs.(Ξes) .< prob.upper_bounds)
@@ -256,7 +261,7 @@ module SINDy_Base
                     for ind=1:n_state
                         biginds = prob.active_Ξ[:,ind]
                         M = transpose(prob.Θ[:,biginds])*prob.Θ[:,biginds]
-                        temp_Ξes[biginds,ind] = inv(M + prob.ρ*Diagonal(ones(size(M,1))))*(transpose(prob.Θ[:,biginds])*prob.du[:,ind])
+                        temp_Ξes[biginds,ind] = inv(M + ρs[i]*Diagonal(ones(size(M,1))))*(transpose(prob.Θ[:,biginds])*prob.du[:,ind])
                     end
                 else
                     for ind=1:n_state
@@ -269,7 +274,7 @@ module SINDy_Base
                 prev_Ξ = prob.active_Ξ
 
                 # calculate the loss and compare it to our best loss
-                loss = SINDy_loss(prob.du, prob.Θ, temp_Ξes, prob.ρ)
+                loss = SINDy_loss(prob.du, prob.Θ, temp_Ξes, prob.η)
                 if loss < min_loss
                     Ξes = copy(temp_Ξes)
                     min_loss = loss

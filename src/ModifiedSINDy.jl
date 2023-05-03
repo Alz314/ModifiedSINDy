@@ -5,16 +5,19 @@ export SINDy_Problem # constructors
 export solve_SINDy, sparsify, CalDerivative # functions
 
 export OLE
+export PFA
 
 #export OLE, ADO, BPSTLSQ
 
 include("base.jl")
 include("OLE.jl")
+include("PFA.jl")
 #include("ADO_OLE.jl")
 #include("BPSTLSQ.jl")
 
 using .SINDy_Base
 using .OLE_Module
+using .PFA_Module
 #using .ADO_OLE_Module
 #using .BPSTLSQ_Module
 
