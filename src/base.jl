@@ -58,7 +58,7 @@ module SINDy_Base
 
     # Constructors for convenience
     # ----------------------------------------------------------------------------------
-    function SINDy_Problem(u, du, dt, basis, λs, iter, alg; STRRidge = false) 
+    function SINDy_Problem(u, du, dt, basis, iter, alg; STRRidge = false, λs = []) 
         Lib = generateLibrary(basis)
         ubs, lbs = determineBounds(basis)
         #ubs = repeat(ubs, 1, size(u)[2])
@@ -76,9 +76,9 @@ module SINDy_Base
 
     BasisTerm(theta::Function, lb, ub) = BandedBasisTerm(theta, lb, ub, false)
 
-    SINDy_Problem(u, du, dt, basis, λs, iter, alg) =  SINDy_Problem(u, du, dt, basis, λs, iter, alg, false)
+    #SINDy_Problem(u, du, dt, basis, λs, iter, alg) =  SINDy_Problem(u, du, dt, basis, λs, iter, alg, false)
 
-    SINDy_Problem(u, du, dt, basis, λs, iter; STRRidge=false) = SINDy_Problem(u, du, dt, basis, λs, iter, Default_SINDy([]); STRRidge = STRRidge)
+    SINDy_Problem(u, du, dt, basis, iter; STRRidge=false, λs = []) = SINDy_Problem(u, du, dt, basis, iter, Default_SINDy([]); STRRidge = STRRidge, λs = λs)
 
     # Functions 
     # ----------------------------------------------------------------------------------
@@ -233,19 +233,34 @@ module SINDy_Base
         X_prev = prob.Θ * Ξes # our first SINDy prediction
         Ξes = Ξes .* prob.active_Ξ
 
+        λs = prob.λs
+        automatic_λ = prob.λs == []
 
         ρs = prob.STRRidge ? prob.ρ*[1+(i-1)/10 for i=1:prob.iter] : fill(prob.ρ, prob.iter)
 
         for i=1:prob.iter
             # At each iteration, try all λ values to find the best one
             prob.active_Ξ = (abs.(Ξes) .> prob.lower_bounds) .|| (abs.(Ξes) .< prob.upper_bounds)
-            for λ in prob.λs
 
+            # adjust the lambda values if we are using automatic lambda search
+            if automatic_λ
+                if all(Ξes .== 0) 
+                    break
+                end
+                λmin = min(abs.(Ξes[Ξes .!= 0])...)
+                λmax = max(abs.(Ξes[Ξes .!= 0])...)
+                λs = range(λmin/10, λmax, 1000*Int(ceil(log10.(λmax/λmin))))
+                #println("λs = ", λs)
+            end
+
+            for λ in λs
                 # Get the index of values whose absolute value is greater than λ
+                temp_active_Ξ = copy(prob.active_Ξ)
                 prob.active_Ξ = (abs.(Ξes)) .> λ
 
                 # If the effect of λ is the same as the previous one, no need to do calculations again
                 if prob.active_Ξ == prev_Ξ
+                    prob.active_Ξ = temp_active_Ξ
                     continue
                 end
 
@@ -275,22 +290,29 @@ module SINDy_Base
 
                 # calculate the loss and compare it to our best loss
                 loss = SINDy_loss(prob.du, prob.Θ, temp_Ξes, prob.η)
+                #println("loss = ", loss, " for λ = ", λ, " with current min loss = ", min_loss)
                 if loss < min_loss
                     Ξes = copy(temp_Ξes)
+                    #println("updating Ξes to ", Ξes)
                     min_loss = loss
+                else
+                    # If the loss is not improved, then we revert the active_Ξ to the previous one
+                    prob.active_Ξ = temp_active_Ξ
                 end
             end
+            #println("finished iteration ", i, " with min loss = ", min_loss, " and Ξes = ", Ξes)
 
             X = prob.Θ * Ξes # make new SINDy prediction
 
             # If nothing, or very little, changed in one iteration, then we have converged
             if _is_converged(X, X_prev, prob.abstol, prob.reltol)
+                #println("converged")
                 break
             end
             
             X_prev = X
         end
-
+        #println("final Ξes = ", prob.active_Ξ)
         return Ξes, min_loss
     end
     
