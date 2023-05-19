@@ -18,8 +18,6 @@ module PFA_Module
         train_pct::Float64
         parallel::Bool
     end
-
-
     
     # Constructors for convenience
     # ----------------------------------------------------------------------------------
@@ -73,11 +71,15 @@ module PFA_Module
         prob.du = du_train
         prob.Θ = θ_train
 
+        Θcond = cond(prob.Θ)
+
         # initial guess
         bestΞ = θ_train \ du_train
         minloss = Inf
         cbest = PFA_params.cs[1]
         loss_vals = []
+
+
         if PFA_params.parallel 
             println("parallel")
             loss_vals = zeros(length(PFA_params.cs))
@@ -85,7 +87,7 @@ module PFA_Module
             @sync @distributed for i in 1:length(PFA_params.cs)
                 c = PFA_params.cs[i]
                 # update prob parameters with new value of c
-                prob.η = c * cond(prob.Θ)
+                prob.η = c * Θcond
                 # solve for Ξ
                 prob.active_Ξ = ones(size(prob.active_Ξ))
                 Ξes, _ = sparsify(prob)
@@ -102,7 +104,7 @@ module PFA_Module
             minloss = loss_vals[best_index]
             cbest = PFA_params.cs[best_index]
             # update prob parameters with new value of c
-            prob.η = cbest * cond(prob.Θ)
+            prob.η = cbest * Θcond
             # solve for Ξ
             prob.active_Ξ = ones(size(prob.active_Ξ))
             bestΞ, _ = sparsify(prob)
@@ -111,7 +113,7 @@ module PFA_Module
             # no parallelization; run sequentially until a bad c value is found
             for c in PFA_params.cs
                 # update prob parameters with new value of c
-                prob.η = c * cond(prob.Θ)
+                prob.η = c * Θcond
                 # solve for Ξ
                 prob.active_Ξ = ones(size(prob.active_Ξ))
                 Ξes, _ = sparsify(prob)
@@ -139,6 +141,9 @@ module PFA_Module
                 end
             end
         end
+
+        # update prob parameters with best value of c
+        prob.η = cbest * Θcond
 
         return bestΞ, minloss, cbest, loss_vals
     end

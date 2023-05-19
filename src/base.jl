@@ -2,7 +2,7 @@ module SINDy_Base
     export Modified_SINDy_Problem, SINDy_Alg, Default_SINDy, AbstractBasisTerm, BasisTerm, BandedBasisTerm # types
     export BaggingSTLSQ #, _BaggingSTLSQ
     export SINDy_Problem # constructors
-    export solve_SINDy, sparsify, CalDerivative, SINDy_loss, _is_converged # functions
+    export solve_SINDy, ensemble_solve_SINDy, sparsify, CalDerivative, SINDy_loss, _is_converged # functions
 
     using LinearAlgebra, StatsBase
 
@@ -13,15 +13,15 @@ module SINDy_Base
     abstract type AbstractBasisTerm end
 
     struct Default_SINDy <: SINDy_Alg 
-        x::Vector{Float64}
+        x::Vector{Real}
     end
     
     mutable struct BaggingSTLSQ <: SINDy_Alg
         batches::Int
-        pct_size::Float32
-        tol::Float32
+        pct_size::Real
+        tol::Real
         pfilt::Bool
-        x::Vector{Float64}
+        x::Vector{Real}
     end
 
     mutable struct BasisTerm <:AbstractBasisTerm
@@ -31,28 +31,28 @@ module SINDy_Base
 
     mutable struct BandedBasisTerm <:AbstractBasisTerm
         theta::Function
-        upper_bound::Float32
-        lower_bound::Float32
+        upper_bound::Real
+        lower_bound::Real
         parameterized::Bool
     end
 
     mutable struct Modified_SINDy_Problem
-        u::Matrix{Float64}
-        du::Matrix{Float64}
-        dt::Float64
+        u::Matrix{Real}
+        du::Matrix{Real}
+        dt::Real
         basis::AbstractArray{<: AbstractBasisTerm}
         Lib::Function
         alg::SINDy_Alg
         STRRidge::Bool
-        λs::Vector{Float64}
-        upper_bounds::Vector{Float32}
-        lower_bounds::Vector{Float32}
+        λs::Vector{Real}
+        upper_bounds::Vector{Real}
+        lower_bounds::Vector{Real}
         iter::Int16
-        ρ::Float64
-        η::Float64
-        abstol::Float64
-        reltol::Float64
-        Θ::Matrix{Float64}
+        ρ::Real
+        η::Real
+        abstol::Real
+        reltol::Real
+        Θ::Matrix{Real}
         active_Ξ::Matrix{Bool}
     end
 
@@ -140,7 +140,35 @@ module SINDy_Base
         return false
     end
 
-    function sparsify(Θ,du,λs,iter; ρ=1, abstol=0.000001, reltol = 0.000001)
+    function generate_lambdas(coeffs)
+        # generates a new set of lambdas for the next iteration of sparse regression
+        # coeffs is a vector or matrix of coefficients from the previous iteration
+        # returns a vector of lambdas for the next iteration
+        
+        # sort our current coefficients
+        coeffs = abs.(vec(coeffs))
+        coeffs = sort(coeffs[coeffs .> 0])
+        # use a tolerance to determine which coefficients are about the same
+        # this is to avoid having too many lambda values
+        # right now I just take the mean of the difference between consecutive coefficients
+        tol = median(coeffs[2:end] - coeffs[1:end-1])
+        # initialize our new lambdas with the first coefficient plus the tolerance
+        λs = [coeffs[1] + tol]
+        # loop through the rest of the coefficients
+        for i in 2:length(coeffs)
+            # if the difference between the current coefficient and the last lambda is greater than the tolerance
+            if coeffs[i] - λs[end] > tol
+                # add the current coefficient to the list of lambdas
+                push!(λs, coeffs[i])
+            end
+        end
+        # remove last lambda so that we won't have an empty set of coefficients after sparsifying
+        pop!(λs)
+        return λs  
+    end
+
+
+    function sparsify(Θ,du,λs,iter; STRRidge = false, ρ=1, abstol=0.000001, reltol = 0.000001)
         # standard sparsify function 
         # Input: 
         #   Θ: The library matrix with size n x p, where n is the data length, p is the number of nonlinear basis. 
@@ -160,8 +188,20 @@ module SINDy_Base
         Ξes = Θ \ du
         X_prev = Θ * Ξes # our first SINDy prediction
 
+        # flag if lambdas are to be automatically determined
+        automatic_λ = λs == []
+
+        # determine rho values for STRRidge or STLSQ
+        ρs = STRRidge ? ρ*[1+(i-1)/10 for i=1:iter] : fill(ρ, iter)
+
         for i=1:iter
             # At each iteration, try all λ values to find the best one
+
+            # if automatic lambda, determine the range of lambdas to test
+            if automatic_λ
+                λs = generate_lambdas(Ξes)
+            end
+
             for λ in λs
 
                 # Get the index of values whose absolute value is smaller than λ
@@ -177,11 +217,24 @@ module SINDy_Base
                 
                 # Set the parameter value of library term whose absolute value is smaller than λ as zero
                 temp_Ξes[smallinds].=0
-                
+
+                 # if any column of temp_Ξes is all zeros, then we have a problem
+                 if any(sum(abs.(temp_Ξes), dims=1) .== 0)
+                    continue
+                end
+
                 # Regress the dynamics to the remaining terms
-                for ind=1:n_state
-                    biginds = .!smallinds[:,ind]
-                    temp_Ξes[biginds,ind] = Θ[:,biginds]\du[:,ind]
+                if STRRidge
+                    for ind=1:n_state
+                        biginds = .!smallinds[:,ind]
+                        M = transpose(Θ[:,biginds])*Θ[:,biginds]
+                        temp_Ξes[biginds,ind] = inv(M + ρs[i]*Diagonal(ones(size(M,1))))*(transpose(Θ[:,biginds])*du[:,ind])
+                    end
+                else
+                    for ind=1:n_state
+                        biginds = .!smallinds[:,ind]
+                        temp_Ξes[biginds,ind] = Θ[:,biginds]\du[:,ind]
+                    end
                 end
 
                 # Save the current small indices
@@ -244,13 +297,17 @@ module SINDy_Base
 
             # adjust the lambda values if we are using automatic lambda search
             if automatic_λ
+                """
                 if all(Ξes .== 0) 
                     break
                 end
                 λmin = min(abs.(Ξes[Ξes .!= 0])...)
                 λmax = max(abs.(Ξes[Ξes .!= 0])...)
                 λs = range(λmin/10, λmax, 1000*Int(ceil(log10.(λmax/λmin))))
-                #println("λs = ", λs)
+                """
+    
+                λs = generate_lambdas(Ξes)
+                #println(λs)
             end
 
             for λ in λs
@@ -269,6 +326,12 @@ module SINDy_Base
                 
                 # Set the parameter value of library term whose absolute value is smaller than λ as zero
                 temp_Ξes[.!prob.active_Ξ].=0
+
+                # if any column of temp_Ξes is all zeros, then we have a problem
+                if any(sum(prob.active_Ξ, dims=1) .== 0)
+                    prob.active_Ξ = temp_active_Ξ
+                    continue
+                end
                 
                 # Regress the dynamics to the remaining terms
 
@@ -276,6 +339,8 @@ module SINDy_Base
                     for ind=1:n_state
                         biginds = prob.active_Ξ[:,ind]
                         M = transpose(prob.Θ[:,biginds])*prob.Θ[:,biginds]
+                        #display(M)
+                        #display(temp_Ξes)
                         temp_Ξes[biginds,ind] = inv(M + ρs[i]*Diagonal(ones(size(M,1))))*(transpose(prob.Θ[:,biginds])*prob.du[:,ind])
                     end
                 else
@@ -391,6 +456,52 @@ module SINDy_Base
 
        # return the filtered coeffs and the inclusion probabilities
        return Ξes, min_loss
+   end
+
+   function ensemble_solve_SINDy(prob::Modified_SINDy_Problem, batches::Int, pct_size::Real, tol::Real, parallel::Bool)
+        # runs ensemble sparse regression on the problem to get a more robust solution
+        if !(prob.alg isa Default_SINDy)
+            solve_SINDy(prob, prob.alg)
+        end
+
+        # initialize the set of bagging terms
+        ΞB = zeros((size(prob.Θ\prob.du)..., batches))
+        # determine batch size
+        batch_size = Int(floor(pct_size * size(prob.Θ)[1]))
+        # perform sparse regression on each batch
+        for i in 1:batches
+            # randomly select batch_size rows from Θ and du
+            batch_indices = sort(sample(1:size(prob.du,1), batch_size, replace=false)) # sort the sampled indices
+            ΘB = prob.Θ[batch_indices, :]
+            duB = prob.du[batch_indices, :]
+            # perform sparse regression on the batch
+            ΞB[:,:,i], _ = sparsify(ΘB, duB, prob.λs, prob.iter, STRRidge = prob.STRRidge, ρ=prob.ρ, abstol=prob.abstol, reltol=prob.reltol)
+        end
+
+        # determine number of times each term appears in the ensemble
+        num_appearances = sum(abs.(ΞB) .> 0, dims=3)[:, :, 1]
+        # compute the inclusion probability for each term
+        ips = num_appearances / batches
+        # Compute the ensembled coefficients 
+        Ξes = sum(ΞB, dims=3)[:, :, 1] ./ num_appearances
+        # probabilistically-filter Ξs based on tol
+        Ξes[ips .< tol] .= 0
+        prob.active_Ξ .= ips .> tol
+
+        # averaging only when Ξes exactly matches ips
+        best_Ξes = zeros(size(Ξes))
+        count = 0
+        for i in 1:batches
+            if all((abs.(ΞB[:,:,i]) .> 0) .== prob.active_Ξ)
+                best_Ξes .= best_Ξes .+ ΞB[:,:,i]
+                count += 1
+            end
+        end
+        if count > 0
+            best_Ξes = best_Ξes ./ count
+        end
+
+       return Ξes, ips, best_Ξes
    end
 
     function CalDerivative(u,dt)
