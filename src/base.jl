@@ -1,10 +1,10 @@
 module SINDy_Base
     export Modified_SINDy_Problem, SINDy_Alg, Default_SINDy, AbstractBasisTerm, BasisTerm, BandedBasisTerm # types
-    export BaggingSTLSQ #, _BaggingSTLSQ
     export SINDy_Problem # constructors
-    export solve_SINDy, ensemble_solve_SINDy, sparsify, CalDerivative, SINDy_loss, _is_converged # functions
+    export solve_SINDy, ensemble_solve_SINDy, sparsify, CalDerivative, SINDy_loss, _is_converged, get_trajectory, calc_AIC, calc_RMSE # functions
 
     using LinearAlgebra, StatsBase
+    using DifferentialEquations
 
     
     # New Data types
@@ -13,15 +13,7 @@ module SINDy_Base
     abstract type AbstractBasisTerm end
 
     struct Default_SINDy <: SINDy_Alg 
-        x::Vector{Real}
-    end
-    
-    mutable struct BaggingSTLSQ <: SINDy_Alg
-        batches::Int
-        pct_size::Real
-        tol::Real
-        pfilt::Bool
-        x::Vector{Real}
+        x::Vector{AbstractFloat}
     end
 
     mutable struct BasisTerm <:AbstractBasisTerm
@@ -31,54 +23,69 @@ module SINDy_Base
 
     mutable struct BandedBasisTerm <:AbstractBasisTerm
         theta::Function
-        upper_bound::Real
-        lower_bound::Real
+        upper_bound::AbstractFloat
+        lower_bound::AbstractFloat
         parameterized::Bool
     end
 
     mutable struct Modified_SINDy_Problem
-        u::Matrix{Real}
-        du::Matrix{Real}
-        dt::Real
+        u::Matrix{AbstractFloat}
+        du::Matrix{AbstractFloat}
+        dt::AbstractFloat
         basis::AbstractArray{<: AbstractBasisTerm}
         Lib::Function
         alg::SINDy_Alg
         STRRidge::Bool
-        λs::Vector{Real}
-        upper_bounds::Vector{Real}
-        lower_bounds::Vector{Real}
+        λs::Vector{AbstractFloat}
+        upper_bounds::Vector{AbstractFloat}
+        lower_bounds::Vector{AbstractFloat}
         iter::Int16
-        ρ::Real
-        η::Real
-        abstol::Real
-        reltol::Real
-        Θ::Matrix{Real}
+        ρ::AbstractFloat
+        η::AbstractFloat
+        abstol::AbstractFloat
+        reltol::AbstractFloat
+        Θ::Matrix{AbstractFloat}
         active_Ξ::Matrix{Bool}
+        param_Ξ::Matrix{Bool}
+        control_Ξ::Matrix{Bool}
     end
 
     # Constructors for convenience
     # ----------------------------------------------------------------------------------
-    function SINDy_Problem(u, du, dt, basis, iter, alg; STRRidge = false, λs = []) 
+    function SINDy_Problem(u, du, dt, basis, iter, alg; STRRidge = false, λs = Vector{AbstractFloat}([]), control = []) 
         Lib = generateLibrary(basis)
         ubs, lbs = determineBounds(basis)
         #ubs = repeat(ubs, 1, size(u)[2])
         #lbs = repeat(lbs, 1, size(u)[2])
-        Θ = Lib(u, alg.x)
-        active_Ξ = ones((length(basis), size(u)[2]))
-        ρ = mean(log10.(eigen(Θ'*Θ).values))
-        η = ρ
-        return Modified_SINDy_Problem(u, du, dt, basis, Lib, alg, STRRidge, λs, ubs, lbs, iter, ρ, η, 0.000001, 0.000001, Θ, active_Ξ)
-    end
 
-    BaggingSTLSQ(batches, pct_size, tol) = BaggingSTLSQ(batches, pct_size, tol, true, [])
+        active_Ξ = ones(Bool, (length(basis), size(u)[2]))
+        param_Ξ = zeros(Bool, size(active_Ξ))
+        for i in 1:length(basis)
+            if basis[i].parameterized
+                param_Ξ[i,:] .= true
+            end
+        end
+
+        if control == []
+            control = ones(Bool, size(active_Ξ))
+        elseif size(control) != size(active_Ξ)
+            controlsize = size(control)
+            activesize = size(active_Ξ)
+            error("Dimensions of control matrix do not match dimensions of basis. Control matrix has dimensions $controlsize, basis has dimensions $activesize")
+        end
+
+        Θ = Lib(u, alg.x)
+        #ρ = mean(log10.(eigen(Θ'*Θ).values))
+        ρ = mean(log10.(abs.(eigen(Θ'*Θ).values)))
+        η = ρ
+        return Modified_SINDy_Problem(u, du, dt, basis, Lib, alg, STRRidge, λs, ubs, lbs, iter, ρ, η, 0.000001, 0.000001, Θ, active_Ξ, param_Ξ, control)
+    end
 
     BasisTerm(theta::Function) = BasisTerm(theta, false)
 
     BasisTerm(theta::Function, lb, ub) = BandedBasisTerm(theta, lb, ub, false)
 
-    #SINDy_Problem(u, du, dt, basis, λs, iter, alg) =  SINDy_Problem(u, du, dt, basis, λs, iter, alg, false)
-
-    SINDy_Problem(u, du, dt, basis, iter; STRRidge=false, λs = []) = SINDy_Problem(u, du, dt, basis, iter, Default_SINDy([]); STRRidge = STRRidge, λs = λs)
+    SINDy_Problem(u, du, dt, basis, iter; STRRidge=false, λs = [], control = []) = SINDy_Problem(u, du, dt, basis, iter, Default_SINDy(Vector{AbstractFloat}()); STRRidge = STRRidge, λs = λs, control = control)
 
     # Functions 
     # ----------------------------------------------------------------------------------
@@ -167,6 +174,70 @@ module SINDy_Base
         return λs  
     end
 
+    # define a function to perform least squares regression with an input SINDy problem
+    function lsq_regress(prob::Modified_SINDy_Problem, ρ = nothing)
+        # if no ρ is given, use the one defined in the SINDy problem
+        if ρ == nothing
+            ρ = prob.ρ
+        end
+
+        Ξes = zeros(AbstractFloat, size(prob.active_Ξ))
+
+        if prob.STRRidge 
+            for ind=1:size(prob.du,2)
+                biginds = prob.active_Ξ[:,ind]
+                M = Matrix{Float64}(transpose(prob.Θ[:,biginds])*prob.Θ[:,biginds])
+                #display(M)
+                #display(temp_Ξes)
+                Ξes[biginds,ind] .= inv(M + prob.ρ*Diagonal(ones(size(M,1))))*(transpose(prob.Θ[:,biginds])*prob.du[:,ind])
+            end
+        else
+            for ind=1:size(prob.du,2)
+                biginds = prob.active_Ξ[:,ind]
+                Ξes[biginds,ind] .= prob.Θ[:,biginds]\prob.du[:,ind]
+            end
+        end
+        return Ξes
+    end
+
+    function get_trajectory(prob::Modified_SINDy_Problem, Ξ::AbstractMatrix, DEAlgorithm = Tsit5())
+        # define the ODE problem
+        #probODE = ODEProblem((u,p,t)->vec(prob.Lib(reshape(u, 1, 3), PFA_params.x) * Ξ), prob.u[1, :], PFA_params.tspan, [])
+        probODE = ODEProblem((u,p,t)->Vector{Float64}(vec(prob.Lib(reshape(u, 1, size(prob.u, 2)), prob.alg.x) * Ξ)), Vector{Float64}(prob.u[1, :]), (Float64(0.0), Float64(prob.dt * (size(prob.u, 1) - 1))), [])
+        # solve the ODE problem
+        sol = solve(probODE, DEAlgorithm, saveat=prob.dt)
+        #sol = solve(probODE, DEAlgorithm, saveat=prob.dt, dt = prob.dt/10)
+        # get output
+        if sol.retcode == ReturnCode.Success
+            return Array(sol)'
+        else
+            println("Error: ", sol.retcode)
+            return Array(sol)'
+        end
+    end
+
+    function calc_AIC(prob::Modified_SINDy_Problem, Ξ::AbstractMatrix)
+        # make derivative predictions
+        du_pred = prob.Lib(prob.u, prob.alg.x) * Ξ
+
+        residuals = prob.du - du_pred
+        rss = sum(residuals.^2)
+        n = size(prob.du, 1)
+        sigma_squared = rss / n
+        likelihood = exp(-0.5 * n * log(2 * π * sigma_squared) - 0.5 * rss / sigma_squared)
+        k = count(x-> abs.(x)>0, Ξ)
+        return 2 * k - 2 * log(likelihood)
+    end
+
+    function calc_RMSE(prob::Modified_SINDy_Problem, Ξ::AbstractMatrix)
+        # make derivative predictions
+        du_pred = prob.Lib(prob.u, prob.alg.x) * Ξ
+
+        residuals = prob.du - du_pred
+        rss = sum(residuals.^2)
+        n = size(prob.du, 1)
+        return sqrt(rss / n)
+    end
 
     function sparsify(Θ,du,λs,iter; STRRidge = false, ρ=1, abstol=0.000001, reltol = 0.000001)
         # standard sparsify function 
@@ -290,10 +361,11 @@ module SINDy_Base
         automatic_λ = prob.λs == []
 
         ρs = prob.STRRidge ? prob.ρ*[1+(i-1)/10 for i=1:prob.iter] : fill(prob.ρ, prob.iter)
+        #ρs = fill(prob.ρ, prob.iter)
 
         for i=1:prob.iter
             # At each iteration, try all λ values to find the best one
-            prob.active_Ξ = (abs.(Ξes) .> prob.lower_bounds) .|| (abs.(Ξes) .< prob.upper_bounds)
+            #prob.active_Ξ = (abs.(Ξes) .> prob.lower_bounds) .|| (abs.(Ξes) .< prob.upper_bounds)
 
             # adjust the lambda values if we are using automatic lambda search
             if automatic_λ
@@ -316,8 +388,8 @@ module SINDy_Base
                 prob.active_Ξ = (abs.(Ξes)) .> λ
 
                 # If the effect of λ is the same as the previous one, no need to do calculations again
-                if prob.active_Ξ == prev_Ξ
-                    prob.active_Ξ = temp_active_Ξ
+                if prob.active_Ξ == temp_active_Ξ
+                    #prob.active_Ξ = temp_active_Ξ
                     continue
                 end
 
@@ -377,88 +449,12 @@ module SINDy_Base
             
             X_prev = X
         end
+        prob.active_Ξ = (abs.(Ξes)) .> 0
         #println("final Ξes = ", prob.active_Ξ)
         return Ξes, min_loss
     end
-    
-    function solve_SINDy(prob::Modified_SINDy_Problem, alg::BaggingSTLSQ)
-       # ============== INPUTS ====================
-       # X: data (possibly collocation)
-       # DX: derivative of data (possibly collocation)
-       # LibFunc: function that computes the library matrix from data
-       # λ: threshold for STLSQ
-       # iter: number of iterations for regression
-       # num_batches: number of batches 
-       # pct_size: (0 < pct_size < 1) percent of data to sample from 
-       # tol: (0<tol<1) tolerance for final thresholding of inclusion probabilities. Ex: if tol=0.5 then only terms w/ ip > 0.5 will be returned 
-       # ===========================================
-   
-       # initialize the set of bagging terms
-       ΞB = zeros((size(prob.Θ\prob.du)..., alg.batches))
-       # determine number of sample size
-       """
-       bag_size = size(prob.u,2) - Int(floor(alg.pct_size*size(prob.u,2))) 
-       for i=1:alg.batches
-           smallinds = sort(sample(1:size(prob.u,2), bag_size, replace=false)) # sort the sampled indices 
-           uB = deepcopy(prob.u)
-           uB[:, smallinds] .= 0
-           duB = deepcopy(prob.du)
-           duB[:, smallinds] .= 0
-           ΘB = prob.Lib(uB, [])
-           ΞB[:,:,i], _ = sparsify(ΘB, duB, prob.λs, prob.iter; abstol = prob.abstol, reltol = prob.reltol)
-       end
-       """
-       
-       bag_size = Int(floor(alg.pct_size*size(prob.u,1))) 
-       for i=1:alg.batches
-           baginds = sort(sample(1:size(prob.u,1), bag_size, replace=false)) # sort the sampled indices 
-           uB = prob.u[baginds, :]
-           duB = prob.du[baginds, :]
-           ΘB = prob.Lib(uB, alg.x)
-           ΞB[:,:,i], _ = sparsify(ΘB, duB, prob.λs, prob.iter; ρ = prob.ρ, abstol = prob.abstol, reltol = prob.reltol)
-       end
 
-       #display(ΞB)
-       # compute the inclusion probability
-       ips = mean(abs.(ΞB).>0 , dims=3)
-       # Compute the ensembled Ξs 
-       Ξes = mean(ΞB, dims=3)[:, :, 1]
-       # probabilistically-filter Ξs based on tol
-       #alg.pfilt ? Ξes[ips .< alg.tol] .= 0 : nothing
-
-       prev_active_Ξ = [1]
-       min_loss = Inf
-        for λ in prob.λs
-            # Get the index of values whose absolute value is greater than λ
-            prob.active_Ξ = (abs.(Ξes)) .> λ
-
-            # If the effect of λ is the same as the previous one, no need to do calculations again
-            if prob.active_Ξ == prev_active_Ξ
-                continue
-            end
-
-            # Make a temporary Ξes matrix to test out the effect of λ
-            temp_Ξes = deepcopy(Ξes)
-
-            # Set the parameter value of library term whose absolute value is smaller than λ as zero
-            temp_Ξes[.!prob.active_Ξ].=0
-
-            # Save the current small indices
-            prev_active_Ξ = prob.active_Ξ
-
-            # calculate the loss and compare it to our best loss
-            loss = SINDy_loss(prob.du, prob.Θ, temp_Ξes, prob.ρ)
-            if loss < min_loss
-                Ξes = deepcopy(temp_Ξes)
-                min_loss = loss
-            end
-        end
-
-       # return the filtered coeffs and the inclusion probabilities
-       return Ξes, min_loss
-   end
-
-   function ensemble_solve_SINDy(prob::Modified_SINDy_Problem, batches::Int, pct_size::Real, tol::Real, parallel::Bool)
+   function ensemble_solve_SINDy(prob::Modified_SINDy_Problem, batches::Int, pct_size::AbstractFloat, tol::AbstractFloat, parallel::Bool)
         # runs ensemble sparse regression on the problem to get a more robust solution
         if !(prob.alg isa Default_SINDy)
             solve_SINDy(prob, prob.alg)
@@ -469,6 +465,8 @@ module SINDy_Base
         # determine batch size
         batch_size = Int(floor(pct_size * size(prob.Θ)[1]))
         # perform sparse regression on each batch
+        batch_prob = deepcopy(prob)
+        """
         for i in 1:batches
             # randomly select batch_size rows from Θ and du
             batch_indices = sort(sample(1:size(prob.du,1), batch_size, replace=false)) # sort the sampled indices
@@ -476,6 +474,16 @@ module SINDy_Base
             duB = prob.du[batch_indices, :]
             # perform sparse regression on the batch
             ΞB[:,:,i], _ = sparsify(ΘB, duB, prob.λs, prob.iter, STRRidge = prob.STRRidge, ρ=prob.ρ, abstol=prob.abstol, reltol=prob.reltol)
+        end
+        """
+        for i in 1:batches
+            # randomly select batch_size rows from Θ and du
+            batch_indices = sort(sample(1:size(prob.du,1), batch_size, replace=false)) # sort the sampled indices
+            batch_prob.Θ = prob.Θ[batch_indices, :]
+            batch_prob.du = prob.du[batch_indices, :]
+            batch_prob.active_Ξ = prob.control_Ξ
+            # perform sparse regression on the batch
+            ΞB[:,:,i], _ = sparsify(batch_prob)
         end
 
         # determine number of times each term appears in the ensemble
@@ -500,6 +508,10 @@ module SINDy_Base
         if count > 0
             best_Ξes = best_Ξes ./ count
         end
+
+        #prob.active_Ξ = Matrix{Bool}([1 0 0; 0 1 0; 0 0 1; 1 1 0; 0 1 1; 0 0 0; 0 0 0; 0 0 0; 0 0 0; 0 0 0])
+        #prob.active_Ξ = Matrix{Bool}([1 0 0; 0 1 0; 0 0 1; 1 1 0; 0 1 1])
+        Ξes = lsq_regress(prob, prob.ρ)
 
        return Ξes, ips, best_Ξes
    end
